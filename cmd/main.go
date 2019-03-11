@@ -20,9 +20,12 @@ func main() {
 	var apiKey, destStr, arrTimeStr, depTimeStr string
 	var (
 		maxDurationMins = 30
-		stepMeters = 500
+		stepMeters      = 500
 	)
 	var opts app.Options
+	var renderKml bool
+
+	flag.BoolVar(&renderKml, "render_kml", false, "render kml")
 
 	flag.StringVar(&apiKey, "key", apiKey, "distance matrix google API key")
 	flag.StringVar(&destStr, "dst", destStr, "destination coords")
@@ -41,14 +44,7 @@ func main() {
 
 	flag.Parse()
 
-	if flag.NArg() != 2 {
-		glog.Fatal("No origin area specified")
-	}
-
-	rectStart, err := PointFromString(flag.Arg(0))
-	CheckErr(err, "Invalid rectStart")
-	rectEnd, err := PointFromString(flag.Arg(1))
-	CheckErr(err, "Invalid rectEnd")
+	var err error
 
 	if arrTimeStr != "" {
 		opts.ArrivalTime, err = time.ParseInLocation(timeLayout, arrTimeStr, time.Now().Location())
@@ -60,18 +56,39 @@ func main() {
 		CheckErr(err, "Invalid depTimeStr")
 	}
 
-	dest, err := PointFromString(destStr)
-	CheckErr(err, "Invalid rectEnd")
+	if renderKml {
+		if flag.NArg() != 1 {
+			glog.Fatal("No datafile specified")
+		}
 
-	err = app.Run(
-		apiKey,
-		dest,
-		rectStart,
-		rectEnd,
-		stepMeters,
-		time.Duration(maxDurationMins)*time.Minute,
-		opts,
-	)
+		err = app.RenderKml(
+			flag.Arg(0),
+			time.Duration(maxDurationMins)*time.Minute,
+			3,
+		)
+
+	} else {
+		if flag.NArg() != 2 {
+			glog.Fatal("No origin area specified")
+		}
+
+		rectStart, err := PointFromString(flag.Arg(0))
+		CheckErr(err, "Invalid rectStart")
+		rectEnd, err := PointFromString(flag.Arg(1))
+		CheckErr(err, "Invalid rectEnd")
+		dest, err := PointFromString(destStr)
+		CheckErr(err, "Invalid rectEnd")
+
+		err = app.FetchResults(
+			apiKey,
+			dest,
+			rectStart,
+			rectEnd,
+			stepMeters,
+			opts,
+		)
+	}
+
 	CheckErr(err, "Failed to run app")
 }
 

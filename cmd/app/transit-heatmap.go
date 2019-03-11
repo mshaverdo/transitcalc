@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
@@ -12,8 +13,9 @@ import (
 	"github.com/twpayne/go-kml"
 	"googlemaps.github.io/maps"
 	"image/color"
-	"time"
+	"io/ioutil"
 	"math"
+	"time"
 )
 
 const (
@@ -23,11 +25,16 @@ const (
 )
 
 type Result struct {
-	s2.LatLng
-	Duration time.Duration
+	Center, A, C s2.LatLng
+	Duration     time.Duration
 }
 
-func Run(apiKey string, dest, areaStart, areaEnd s2.LatLng, stepMeters int, maxDuration time.Duration, opts Options) error {
+type ResultContainer struct {
+	AreaStart, AreaEnd s2.LatLng
+	Results            []Result
+}
+
+func FetchResults(apiKey string, dest, areaStart, areaEnd s2.LatLng, stepMeters int, opts Options) error {
 	stepLat := s1.Angle(float64(stepMeters) / earthRadius)
 	stepLon := s1.Angle(float64(stepMeters) / (earthRadius * math.Cos(float64(dest.Lat))))
 
@@ -60,7 +67,7 @@ func Run(apiKey string, dest, areaStart, areaEnd s2.LatLng, stepMeters int, maxD
 			}
 
 			for origins := range originsCh {
-				results, err := getResults(client, origins, dest, opts)
+				results, err := getResults(client, origins, dest, opts, stepLat, stepLon)
 				if err != nil {
 					glog.Fatalf("failed to get results: %v", err)
 				}
@@ -70,28 +77,46 @@ func Run(apiKey string, dest, areaStart, areaEnd s2.LatLng, stepMeters int, maxD
 		}()
 	}
 
-	var results []Result
+	container := ResultContainer{AreaStart: areaStart, AreaEnd: areaEnd}
 	for i := 0; i < len(origins); i += maxElements {
-		results = append(results, (<-resultsCh)...)
+		container.Results = append(container.Results, (<-resultsCh)...)
 		glog.Infof("%d/%d origins fetched", i, len(origins))
 	}
 
-	data, err := getKml(
-		results,
-		stepLat,
-		stepLon,
-		areaStart,
-		areaEnd,
-		maxDuration,
-		3,
-	)
+	data, err := json.Marshal(container)
+	if err != nil {
+		return errors.Wrap(err, "faled to marshal json")
+	}
 
 	fmt.Printf("\n\n\n%s\n\n", data)
 
 	return nil
 }
 
-func getResults(client *maps.Client, origins []s2.LatLng, dest s2.LatLng, opts Options) ([]Result, error) {
+func RenderKml(jsonFile string, maxDuration time.Duration, grades int) error {
+	data, err := ioutil.ReadFile(jsonFile)
+	if err != nil {
+		return errors.Wrap(err, fmt.Sprintf("faled to read file %q", jsonFile))
+	}
+
+	var container ResultContainer
+
+	err = json.Unmarshal(data, &container)
+	if err != nil {
+		return errors.Wrap(err, "faled to unmarshal json")
+	}
+
+	renderedKml, err := getKml(container.Results, container.AreaStart, container.AreaEnd, maxDuration, grades)
+	if err != nil {
+		return errors.Wrap(err, "faled to get KML")
+	}
+
+	fmt.Printf("\n\n\n%s\n\n", renderedKml)
+
+	return nil
+}
+
+func getResults(client *maps.Client, origins []s2.LatLng, dest s2.LatLng, opts Options, stepLat, stepLon s1.Angle) ([]Result, error) {
 	r := &maps.DistanceMatrixRequest{
 		Destinations: []string{latLonToSt5ring(dest)},
 	}
@@ -129,8 +154,11 @@ func getResults(client *maps.Client, origins []s2.LatLng, dest s2.LatLng, opts O
 			duration = row.Elements[0].DurationInTraffic
 		}
 
+		a, c := getOriginBounds(origins[i], stepLat, stepLon)
 		result := Result{
-			LatLng:   origins[i],
+			Center:   origins[i],
+			A:        a,
+			C:        c,
 			Duration: duration,
 		}
 
@@ -140,13 +168,16 @@ func getResults(client *maps.Client, origins []s2.LatLng, dest s2.LatLng, opts O
 	return results, nil
 }
 
-func getKml(results []Result, stepLat, stepLon s1.Angle, areaStart, areaEnd s2.LatLng, maxDuration time.Duration, grades int, ) ([]byte, error) {
-	grades = 3
+func getKml(results []Result, areaStart, areaEnd s2.LatLng, maxDuration time.Duration, grades int) ([]byte, error) {
+	grades = 6
 	styles := []*kml.SharedElement{
-		kml.SharedStyle("zone-denied", kml.PolyStyle(kml.Color(color.RGBA{})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128}))),
-		kml.SharedStyle("zone-0", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0, G: 0xFF})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0, G: 0xFF, B: 0})), ),
-		kml.SharedStyle("zone-1", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0xFF, G: 0xFF})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0xFF, G: 0xFF, B: 0})), ),
-		kml.SharedStyle("zone-2", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0xFF, G: 0x8C})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0xFF, G: 0, B: 0}))),
+		kml.SharedStyle("zone-denied", kml.PolyStyle(kml.Color(color.RGBA{})), kml.LineStyle(kml.Width(0))),
+		kml.SharedStyle("zone-0", kml.PolyStyle(kml.Color(color.RGBA{A: 0x70, R: 0x00, G: 0xFF})), kml.LineStyle(kml.Width(0))),
+		kml.SharedStyle("zone-1", kml.PolyStyle(kml.Color(color.RGBA{A: 0x70, R: 0x88, G: 0xFF})), kml.LineStyle(kml.Width(0))),
+		kml.SharedStyle("zone-2", kml.PolyStyle(kml.Color(color.RGBA{A: 0x70, R: 0xFF, G: 0xFF})), kml.LineStyle(kml.Width(0))),
+		kml.SharedStyle("zone-3", kml.PolyStyle(kml.Color(color.RGBA{A: 0x70, R: 0xFF, G: 0xAA})), kml.LineStyle(kml.Width(0))),
+		kml.SharedStyle("zone-4", kml.PolyStyle(kml.Color(color.RGBA{A: 0x70, R: 0xFF, G: 0x55})), kml.LineStyle(kml.Width(0))),
+		kml.SharedStyle("zone-5", kml.PolyStyle(kml.Color(color.RGBA{A: 0x70, R: 0xFF, G: 0x00})), kml.LineStyle(kml.Width(0))),
 	}
 
 	document := kml.Document()
@@ -163,12 +194,11 @@ func getKml(results []Result, stepLat, stepLon s1.Angle, areaStart, areaEnd s2.L
 	)
 
 	for _, result := range results {
-		a, c := getOriginBounds(result.LatLng, stepLat, stepLon)
 		folder.Add(
 			kml.Placemark(
 				kml.Name(fmt.Sprintf(fmt.Sprintf("%.0f min", result.Duration.Minutes()))),
 				kml.StyleURL(getStyleId(result.Duration, maxDuration, grades)),
-				getPoly(a, c),
+				getPoly(result.A, result.C),
 			),
 		)
 	}
