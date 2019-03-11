@@ -12,54 +12,86 @@ import (
 	"github.com/twpayne/go-kml"
 	"googlemaps.github.io/maps"
 	"image/color"
-	"math"
 	"time"
+	"math"
 )
 
 const (
 	maxElements = 25
+	earthRadius = 6378137
+	workers     = 20
 )
 
-func Run(apiKey string, dest, rectStart, rectEnd s2.LatLng, stepMeters int, maxDuration time.Duration, opts Options) error {
-	client, err := maps.NewClient(maps.WithAPIKey(apiKey))
-	if err != nil {
-		return errors.Wrap(err, "faled to create client")
-	}
+type Result struct {
+	s2.LatLng
+	Duration time.Duration
+}
 
-	stepLat := s1.Angle(float64(stepMeters)/111337.0) * s1.Degree
-	stepLon := s1.Angle(float64(stepMeters)/62794.0) * s1.Degree
+func Run(apiKey string, dest, areaStart, areaEnd s2.LatLng, stepMeters int, maxDuration time.Duration, opts Options) error {
+	stepLat := s1.Angle(float64(stepMeters) / earthRadius)
+	stepLon := s1.Angle(float64(stepMeters) / (earthRadius * math.Cos(float64(dest.Lat))))
 
-	origins, err := getLatLngsInRect(rectStart, rectEnd, stepLat, stepLon)
+	origins, err := getLatLngsInRect(areaStart, areaEnd, stepLat, stepLon)
 	if err != nil {
 		return errors.Wrap(err, "faled to get src points")
 	}
 
-	var rows []maps.DistanceMatrixElementsRow
+	resultsCh := make(chan []Result)
+	originsCh := make(chan []s2.LatLng)
 
+	go func() {
+		for i := 0; i < len(origins); i += maxElements {
+			end := i + maxElements
+			if end > len(origins) {
+				end = len(origins)
+			}
+
+			originsCh <- origins[i:end]
+		}
+
+		close(originsCh)
+	}()
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			client, err := maps.NewClient(maps.WithAPIKey(apiKey))
+			if err != nil {
+				glog.Fatalf("failed to create client: %v", err)
+			}
+
+			for origins := range originsCh {
+				results, err := getResults(client, origins, dest, opts)
+				if err != nil {
+					glog.Fatalf("failed to get results: %v", err)
+				}
+
+				resultsCh <- results
+			}
+		}()
+	}
+
+	var results []Result
 	for i := 0; i < len(origins); i += maxElements {
-		end := i + maxElements
-		if end > len(origins) {
-			end = len(origins)
-		}
-
-		rowsChunk, err := getRows(client, origins[i:end], dest, opts)
-		if err != nil {
-			return err
-		}
-
-		rows = append(rows, rowsChunk...)
-
+		results = append(results, (<-resultsCh)...)
 		glog.Infof("%d/%d origins fetched", i, len(origins))
 	}
 
-	data, err := getKml(origins, rows, stepLat, stepLon, maxDuration, 3)
+	data, err := getKml(
+		results,
+		stepLat,
+		stepLon,
+		areaStart,
+		areaEnd,
+		maxDuration,
+		3,
+	)
 
 	fmt.Printf("\n\n\n%s\n\n", data)
 
 	return nil
 }
 
-func getRows(client *maps.Client, origins []s2.LatLng, dest s2.LatLng, opts Options) ([]maps.DistanceMatrixElementsRow, error) {
+func getResults(client *maps.Client, origins []s2.LatLng, dest s2.LatLng, opts Options) ([]Result, error) {
 	r := &maps.DistanceMatrixRequest{
 		Destinations: []string{latLonToSt5ring(dest)},
 	}
@@ -76,45 +108,13 @@ func getRows(client *maps.Client, origins []s2.LatLng, dest s2.LatLng, opts Opti
 		return nil, errors.Wrap(err, "faled to process request")
 	}
 
-	return resp.Rows, nil
-}
-
-func getKml(origins []s2.LatLng, rows []maps.DistanceMatrixElementsRow, stepLat, stepLon s1.Angle, maxDuration time.Duration, grades int, ) ([]byte, error) {
-	if len(origins) != len(rows) {
-		return nil, fmt.Errorf("len(origins) != len(resp.Rows): %d != %d ", len(origins), len(rows))
+	if len(origins) != len(resp.Rows) {
+		return nil, fmt.Errorf("len(origins) != len(resp.Rows): %d != %d ", len(origins), len(resp.Rows))
 	}
 
-	if len(origins) == 0 {
-		return nil, nil
-	}
+	var results []Result
 
-	grades = 3
-	styles := []*kml.SharedElement{
-		kml.SharedStyle("zone0", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0, G: 0xFF, B: 0})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0, G: 0xFF, B: 0})), ),
-		kml.SharedStyle("zone1", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0xFF, G: 0xFF, B: 0})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0xFF, G: 0xFF, B: 0})), ),
-		kml.SharedStyle("zone2", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0xFF, G: 0x8C, B: 0})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0xFF, G: 0, B: 0}))),
-	}
-
-	document := kml.Document()
-	for _, v := range styles {
-		document.Add(v)
-	}
-
-	// add boundaries
-	areaLat := (origins[0].Lat + origins[len(origins)-1].Lat) / 2
-	areaLon := (origins[0].Lng + origins[len(origins)-1].Lng) / 2
-	areaHeight := s1.Angle(math.Abs(float64(origins[0].Lat - origins[len(origins)-1].Lat)))
-	areaWidth := s1.Angle(math.Abs(float64(origins[0].Lng - origins[len(origins)-1].Lng)))
-	area := getPoly(s2.LatLng{Lat: areaLat, Lng: areaLon}, areaHeight, areaWidth)
-
-	folder := kml.Folder(
-		kml.Placemark(
-			kml.Style(kml.PolyStyle(kml.Color(color.RGBA{A: 0, R: 0, G: 0, B: 0}))),
-			area,
-		),
-	)
-
-	for i, row := range rows {
+	for i, row := range resp.Rows {
 		if len(row.Elements) != 1 {
 			glog.Warning("Row elements != 1: ", pretty.Sprint(row))
 			continue
@@ -128,15 +128,47 @@ func getKml(origins []s2.LatLng, rows []maps.DistanceMatrixElementsRow, stepLat,
 		if row.Elements[0].DurationInTraffic > 0 {
 			duration = row.Elements[0].DurationInTraffic
 		}
-		if duration > maxDuration {
-			continue
+
+		result := Result{
+			LatLng:   origins[i],
+			Duration: duration,
 		}
 
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+func getKml(results []Result, stepLat, stepLon s1.Angle, areaStart, areaEnd s2.LatLng, maxDuration time.Duration, grades int, ) ([]byte, error) {
+	grades = 3
+	styles := []*kml.SharedElement{
+		kml.SharedStyle("zone-denied", kml.PolyStyle(kml.Color(color.RGBA{})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128}))),
+		kml.SharedStyle("zone-0", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0, G: 0xFF})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0, G: 0xFF, B: 0})), ),
+		kml.SharedStyle("zone-1", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0xFF, G: 0xFF})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0xFF, G: 0xFF, B: 0})), ),
+		kml.SharedStyle("zone-2", kml.PolyStyle(kml.Color(color.RGBA{A: 80, R: 0xFF, G: 0x8C})), kml.LineStyle(kml.Width(0), kml.Color(color.RGBA{A: 128, R: 0xFF, G: 0, B: 0}))),
+	}
+
+	document := kml.Document()
+	for _, v := range styles {
+		document.Add(v)
+	}
+
+	// add boundaries
+	folder := kml.Folder(
+		kml.Placemark(
+			kml.Style(kml.PolyStyle(kml.Color(color.RGBA{}))),
+			getPoly(areaStart, areaEnd),
+		),
+	)
+
+	for _, result := range results {
+		a, c := getOriginBounds(result.LatLng, stepLat, stepLon)
 		folder.Add(
 			kml.Placemark(
-				kml.Name(fmt.Sprintf(fmt.Sprintf("%.0f min", duration.Minutes()))),
-				kml.StyleURL(fmt.Sprintf(`#zone%d`, getStyleId(duration, maxDuration, grades))),
-				getPoly(origins[i], stepLat, stepLon),
+				kml.Name(fmt.Sprintf(fmt.Sprintf("%.0f min", result.Duration.Minutes()))),
+				kml.StyleURL(getStyleId(result.Duration, maxDuration, grades)),
+				getPoly(a, c),
 			),
 		)
 	}
@@ -146,33 +178,26 @@ func getKml(origins []s2.LatLng, rows []maps.DistanceMatrixElementsRow, stepLat,
 	buf := new(bytes.Buffer)
 	err := kml.KML(document).WriteIndent(buf, " ", " ")
 	if err != nil {
-		return nil, errors.Wrap(err, "faled to write KML")
+		return nil, errors.Wrap(err, "failed to write KML")
 	}
 
 	return buf.Bytes(), nil
 }
 
-func getStyleId(duration, maxDuration time.Duration, grades int) int {
+func getStyleId(duration, maxDuration time.Duration, grades int) string {
+	if duration > maxDuration {
+		return "#zone-denied"
+	}
 	grade := uint64(grades) * uint64(duration) / uint64(maxDuration)
-	return int(grade)
+	return fmt.Sprintf(`#zone-%d`, grade)
 }
 
-func getPoly(origin s2.LatLng, stepLat, stepLon s1.Angle) *kml.CompoundElement {
-	//stepLat *= 0.99
-	a, b, c, d := origin, origin, origin, origin
+func getOriginBounds(origin s2.LatLng, stepLat, stepLon s1.Angle) (a, c s2.LatLng) {
+	return s2.LatLng{Lat: origin.Lat + stepLat/2, Lng: origin.Lng - stepLon/2},
+		s2.LatLng{Lat: origin.Lat - stepLat/2, Lng: origin.Lng + stepLon/2}
+}
 
-	a.Lat -= stepLat / 2
-	a.Lng += stepLon / 2
-
-	b.Lat += stepLat / 2
-	b.Lng += stepLon / 2
-
-	c.Lat += stepLat / 2
-	c.Lng -= stepLon / 2
-
-	d.Lat -= stepLat / 2
-	d.Lng -= stepLon / 2
-
+func getPoly(a, c s2.LatLng) *kml.CompoundElement {
 	poly := kml.Polygon(
 		kml.Extrude(true),
 		kml.AltitudeMode("relativeToGround"),
@@ -180,9 +205,9 @@ func getPoly(origin s2.LatLng, stepLat, stepLon s1.Angle) *kml.CompoundElement {
 			kml.LinearRing(
 				kml.Coordinates(
 					kml.Coordinate{Lat: a.Lat.Degrees(), Lon: a.Lng.Degrees()},
-					kml.Coordinate{Lat: b.Lat.Degrees(), Lon: b.Lng.Degrees()},
+					kml.Coordinate{Lat: a.Lat.Degrees(), Lon: c.Lng.Degrees()},
 					kml.Coordinate{Lat: c.Lat.Degrees(), Lon: c.Lng.Degrees()},
-					kml.Coordinate{Lat: d.Lat.Degrees(), Lon: d.Lng.Degrees()},
+					kml.Coordinate{Lat: c.Lat.Degrees(), Lon: a.Lng.Degrees()},
 				),
 			),
 		),
@@ -206,12 +231,6 @@ func getLatLngsInRect(rectStart, rectEnd s2.LatLng, stepLat, stepLon s1.Angle) (
 	}
 
 	return
-
-	//return []s2.LatLng{
-	//	s2.LatLngFromDegrees(55.795846, 37.403290),
-	//	s2.LatLngFromDegrees(55.806238, 37.515073),
-	//	s2.LatLngFromDegrees(55.742389, 37.488608),
-	//}, nil
 }
 
 func latLonToSt5ring(ll s2.LatLng) string {
